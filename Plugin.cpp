@@ -9,10 +9,6 @@
 
 namespace GOTHIC_ENGINE
 {
-	bool FasterOutOfCombatRegen = false;
-	bool UseHealthRegeneration = false;
-	bool UseManaRegeneration = false;
-	bool UseStreakBonus = false;
 	int32 ManaRegenerationTime = INT_MAX;
 	int32 ManaRegenerationPercent = 0;
 	int32 HPRegenerationTime = INT_MAX;
@@ -20,46 +16,70 @@ namespace GOTHIC_ENGINE
 	int32 OutOfCombatMultiplier = 1;
 	int32 StreakBonusPercent = 0;
 	int32 StreakCount = 0;
+	int32 StreakResetTime = 0;
+
+	std::vector<oCNpc*> Npcs;
 
 	void Game_Entry(void)
 	{ }
 
-	std::unordered_map<oCNpc*, int32> HitStreaksMap;
-	std::unordered_map<oCNpc*, zCView*> PlayerViews;
+	struct HitStreak
+	{
+		int32 StreakCount = 0;
+		RegenerationTimer HitStreakTimer;
+	};
 
+	std::unordered_map<oCNpc*, zCView*> PlayerViews;
+	std::unordered_map<oCNpc*, HitStreak> HitStreakMap;
+	
 	typedef zCView* (*Gothic2SplitscreenCoop_GetPlayerView)(int PlayerID);
 	Gothic2SplitscreenCoop_GetPlayerView GetPlayerView = nullptr;
-
+	
 	typedef oCNpc* (*Gothic2SplitscreenCoop_GetPlayer)(int PlayerID);
 	Gothic2SplitscreenCoop_GetPlayer GetPlayer = nullptr;
-
+	
 	typedef zCCamera* (*Gothic2SplitscreenCoop_GetPlayerCam)(int PlayerID);
 	Gothic2SplitscreenCoop_GetPlayerCam GetPlayerCam = nullptr;
 
+	bool IsStreakBonusActive(void)
+	{
+		return StreakBonusPercent > 0 &&
+			StreakCount > 0 &&
+			StreakResetTime > 0;
+	}
+	bool IsManaRegenerationActive(void)
+	{
+		return ManaRegenerationTime > 0 && ManaRegenerationPercent > 0;
+	}
+	bool IsHPRegenerationActive(void)
+	{
+		return HPRegenerationTime > 0 && HPRegenerationPercent > 0;
+	}
+
 	void Game_Init(void)
 	{
-		UseHealthRegeneration = zoptions->ReadBool("GOTHIC_COOP_REGENERATION", "UseHealthRegen", true);
-		UseManaRegeneration = zoptions->ReadBool("GOTHIC_COOP_REGENERATION", "UseManaRegen", true);
-		ManaRegenerationTime = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "ManaRegenerationTime", 1);
+		ManaRegenerationTime = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "ManaRegenerationTime", 5);
 		ManaRegenerationPercent = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "ManaRegenerationPercent", 1);
 		HPRegenerationTime = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "HPRegenerationTime", 5);
 		HPRegenerationPercent = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "HPRegenerationPercent", 1);
-		FasterOutOfCombatRegen = zoptions->ReadBool("GOTHIC_COOP_REGENERATION", "FasterOutOfCombatRegen", true);
 		OutOfCombatMultiplier = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "OutOfCombatMultiplier", 3);
 		StreakBonusPercent = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "StreakBonusPercent", 10);
-		UseStreakBonus = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "UseStreakBonus", true);
 		StreakCount = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "StreakCount", 10);
-
+		StreakResetTime = zoptions->ReadInt("GOTHIC_COOP_REGENERATION", "StreakResetTime", 5);
+		
 		HMODULE CoopHandle = GetModuleHandle(TEXT("Gothic2SplitscreenCoop.dll"));
+		
+		if (!CoopHandle) return;
+		
 		GetPlayerView = reinterpret_cast<Gothic2SplitscreenCoop_GetPlayerView>(
 			GetProcAddress(CoopHandle, "GetPlayerView")
-			);
+		);
 		GetPlayer = reinterpret_cast<Gothic2SplitscreenCoop_GetPlayer>(
 			GetProcAddress(CoopHandle, "GetPlayer")
-			);
+		);
 		GetPlayerCam = reinterpret_cast<Gothic2SplitscreenCoop_GetPlayerCam>(
 			GetProcAddress(CoopHandle, "GetPlayerCam")
-			);
+		);
 	}
 
 	void Game_Exit(void)
@@ -70,7 +90,7 @@ namespace GOTHIC_ENGINE
 
 	RegenerationTimer HealthTimer;
 	RegenerationTimer ManaTimer;
-
+	
 	template <typename T>
 	T Clamp(T value, T min, T max)
 	{
@@ -81,56 +101,63 @@ namespace GOTHIC_ENGINE
 
 	void Game_Loop(void)
 	{
-		std::vector<oCNpc*> Npcs;
-		Npcs.push_back(oCNpc::player);
-		for (uint32 idx = 1; idx <= MAX_PLAYERS - 1; idx++)
-		{
-			oCNpc* PlayerNpc = GetPlayer(idx);
-			if (PlayerNpc) Npcs.push_back(PlayerNpc);
-		}
-
-		if (UseHealthRegeneration && (HealthTimer.Elapsed() >= HPRegenerationTime))
+		if (IsHPRegenerationActive() && (HealthTimer.Elapsed() >= HPRegenerationTime))
 		{
 			for (auto& Npc : Npcs)
 			{
 				if (!Npc || Npc->IsDead() || Npc->IsUnconscious()) continue;
-
+		
 				float Multiplier = 1.0f;
-				if (FasterOutOfCombatRegen && Npc->IsInFightMode_S(NPC_WEAPON_NONE))
+				if (OutOfCombatMultiplier > 0 && Npc->IsInFightMode_S(NPC_WEAPON_NONE))
 					Multiplier = static_cast<float>(OutOfCombatMultiplier);
-
+		
 				auto Value = static_cast<int32>(roundf((Npc->attribute[NPC_ATR_HITPOINTSMAX] * 0.01f * HPRegenerationPercent * Multiplier)));
-				Value = Clamp(Value, 1, Npc->attribute[NPC_ATR_MANAMAX]);
+				Value = Clamp(Value, 1, Npc->attribute[NPC_ATR_HITPOINTSMAX]);
 				Npc->attribute[NPC_ATR_HITPOINTS] = Clamp(Npc->attribute[NPC_ATR_HITPOINTS] + Value, 0, Npc->attribute[NPC_ATR_HITPOINTSMAX]);
 			}
-
+		
 			HealthTimer.Reset();
 		}
-		if (UseManaRegeneration && (ManaTimer.Elapsed() >= ManaRegenerationTime))
+		if (IsManaRegenerationActive() && (ManaTimer.Elapsed() >= ManaRegenerationTime))
 		{
 			for (auto& Npc : Npcs)
 			{
 				if (!Npc || Npc->IsDead() || Npc->IsUnconscious()) continue;
-
+		
 				float Multiplier = 1.0f;
-				if (FasterOutOfCombatRegen && Npc->IsInFightMode_S(NPC_WEAPON_NONE))
+				if (OutOfCombatMultiplier > 0 && Npc->IsInFightMode_S(NPC_WEAPON_NONE))
 					Multiplier = static_cast<float>(OutOfCombatMultiplier);
-
+		
 				auto Value = static_cast<int32>(roundf((Npc->attribute[NPC_ATR_MANAMAX] * 0.01f * ManaRegenerationPercent * Multiplier)));
 				Value = Clamp(Value, 1, Npc->attribute[NPC_ATR_MANAMAX]);
 				Npc->attribute[NPC_ATR_MANA] = Clamp(Npc->attribute[NPC_ATR_MANA] + Value, 0, Npc->attribute[NPC_ATR_MANAMAX]);
 			}
-
+		
 			ManaTimer.Reset();
 		}
+		
+		if (!IsStreakBonusActive()) return;
 
-		for (auto& HitStreak : HitStreaksMap)
+		for (auto& StreakMapPair : HitStreakMap)
 		{
+			// check if hit streak timer is greater than StreakResetTime
+			if (StreakResetTime >= 1 &&
+				StreakMapPair.second.HitStreakTimer.Elapsed() >= StreakResetTime &&
+				StreakMapPair.second.StreakCount > 0)
+			{
+				// reset hit streak
+				StreakMapPair.second.StreakCount = 0;
+				StreakMapPair.second.HitStreakTimer.Reset();
+
+				zCView* View = PlayerViews[StreakMapPair.first];
+				if (View) View->PrintTimed(100, 100, string::Combine("Kombo: %ix", StreakMapPair.second.StreakCount), 1000.0f, nullptr);
+			}
+
 			// check if hit streak is greater than StreakCount
-			if (HitStreak.second >= StreakCount)
+			if (StreakMapPair.second.StreakCount >= StreakCount)
 			{
 				// check if player is alive
-				auto Player = HitStreak.first;
+				auto Player = StreakMapPair.first;
 				if (!Player || Player->IsDead() || Player->IsUnconscious()) continue;
 
 				// check if player is in fight mode (without magic)
@@ -142,7 +169,7 @@ namespace GOTHIC_ENGINE
 					Player->attribute[NPC_ATR_HITPOINTS] = Value;
 
 					zCView* View = PlayerViews[Player];
-					if (View) View->PrintTimed(100, 300, string::Combine("+%i%% Lebensenergie-Bonus für %ier Kombo", StreakBonusPercent, HitStreak.second), 3000.0f, nullptr);
+					if (View) View->PrintTimed(100, 300, string::Combine("+%i%% Lebensenergie-Bonus für %ier Kombo", StreakBonusPercent, StreakMapPair.second), 3000.0f, nullptr);
 				}
 				else if (Player->IsInFightMode_S(NPC_WEAPON_MAG))
 				{
@@ -152,11 +179,11 @@ namespace GOTHIC_ENGINE
 					Player->attribute[NPC_ATR_MANA] = Value;
 
 					zCView* View = PlayerViews[Player];
-					if (View) View->PrintTimed(100, 300, string::Combine("+%i%% Mana-Bonus für %der Kombo", StreakBonusPercent, HitStreak.second), 3000.0f, nullptr);
+					if (View) View->PrintTimed(100, 300, string::Combine("+%i%% Mana-Bonus für %ier Kombo", StreakBonusPercent, StreakMapPair.second), 3000.0f, nullptr);
 				}
 
 				// reset hit streak
-				HitStreak.second = 0;
+				StreakMapPair.second.StreakCount = 0;
 			}
 		}
 	}
@@ -181,21 +208,47 @@ namespace GOTHIC_ENGINE
 
 	void LoadEnd(void)
 	{
-		HitStreaksMap.clear();
+		Npcs.clear();
+		if (IsStreakBonusActive())
+			HitStreakMap.clear();
 		PlayerViews.clear();
 
-		HitStreaksMap.emplace(oCNpc::player, 0);
-		PlayerViews.emplace(oCNpc::player, ogame->array_view[oCGame::oEGameDialogView::GAME_VIEW_SCREEN]);
+		Npcs.push_back(oCNpc::player);
+
+		if (GetPlayer)
+		{
+			for (uint32 idx = 1; idx <= MAX_PLAYERS - 1; idx++)
+			{
+				oCNpc* PlayerNpc = GetPlayer(idx);
+				if (PlayerNpc) Npcs.push_back(PlayerNpc);
+			}
+		}
+
+		// Main player hit streak insertion
+		if (IsStreakBonusActive())
+		{
+			HitStreak MainPlayerCombo{ };
+			HitStreakMap.emplace(oCNpc::player, MainPlayerCombo);
+			PlayerViews.emplace(oCNpc::player, ogame->array_view[oCGame::oEGameDialogView::GAME_VIEW_SCREEN]);
+		}
+		
 		for (uint32 idx = 1; idx <= MAX_PLAYERS - 1; idx++)
 		{
+			if (!GetPlayer) continue;
+		
 			oCNpc* PlayerNpc = GetPlayer(idx);
 			if (!PlayerNpc) continue;
-
-			HitStreaksMap.emplace(PlayerNpc, 0);
-
+		
+			// coop player hit streak insertion
+			if (IsStreakBonusActive())
+			{
+				HitStreak SubPlayerCombo{ };
+				HitStreakMap.emplace(PlayerNpc, SubPlayerCombo);
+			}
+		
 			// Try to find coop player views
 			if (!GetPlayerView) continue;
-
+		
 			// coop player views found! add them to the map.
 			zCView* PlayerView = GetPlayerView(idx);
 			PlayerViews.emplace(PlayerNpc, PlayerView);
@@ -283,14 +336,19 @@ namespace GOTHIC_ENGINE
 	void oCNpc::OnDamage_Hit_Union(oSDamageDescriptor& descDamage)
 	{
 		THISCALL(Hook_oCNpc_OnDamage_Hit)(descDamage);
-
-		if (!UseStreakBonus) return;
-
-		if (HitStreaksMap.count(descDamage.pNpcAttacker) != 0)
-			HitStreaksMap.at(descDamage.pNpcAttacker) += 1;
-
-		if (HitStreaksMap.count(this) != 0)
-			HitStreaksMap[this] = 0;
+	
+		if (!IsStreakBonusActive()) return;
+	
+		if (HitStreakMap.count(descDamage.pNpcAttacker) != 0)
+		{
+			HitStreakMap.at(descDamage.pNpcAttacker).StreakCount += 1;
+			zCView* View = PlayerViews[descDamage.pNpcAttacker];
+			if (View) View->PrintTimed(100, 100, string::Combine("Kombo: %ix", HitStreakMap.at(descDamage.pNpcAttacker).StreakCount), 1000.0f, nullptr);
+			HitStreakMap.at(descDamage.pNpcAttacker).HitStreakTimer.Reset();
+		}
+	
+		if (HitStreakMap.count(this) != 0)
+			HitStreakMap[this].StreakCount = 0;
 	}
 
 #define AppDefault True
